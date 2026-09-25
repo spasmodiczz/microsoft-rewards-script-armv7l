@@ -1,0 +1,32 @@
+sessions/
+dist/
+.dev/
+node_modules/
+/config.json
+# ClawBot 微信推送的扫码凭证（含 bot token），严禁提交
+/clawbot-auth.json
+# 运行时配置/账号文件可能被放到 src/ 下（Load.ts 的查找路径之一），防止误提交
+/src/config.json
+/src/accounts.json
+/src/accounts.dev.json
+/.vscode
+/diagnostics
+note
+.DS_Store
+.playwright-chromium-installed
+.stfolder/
+.envlogs/
+/logs
+# 本地私密配置与编辑器工作目录，严禁提交
+/.env
+/.env.rk3229
+/.zcode/
+/scripts/tests
+# 注: /docs 在本 fork 中作为公开文档目录随仓库发布，故不再忽略
+
+# 部署/运行期产物
+/deploy/sessions/
+/deploy/logs/
+/deploy/browser/
+*.log
+*.tgz

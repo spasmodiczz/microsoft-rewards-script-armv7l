@@ -1,0 +1,1398 @@
+--- a/src/browser/Browser.ts	2026-09-14 10:22:10.000000000 +0800
++++ b/src/browser/Browser.ts	2026-09-24 19:26:51.000000000 +0800
+@@ -79,6 +79,26 @@
+                 ? ['--ignore-certificate-errors', '--ignore-certificate-errors-spki-list', '--ignore-ssl-errors']
+                 : []
+ 
++            // CHROME_PATH: 使用系统安装的 Chromium（armhf 等没有 Playwright 官方构建的平台必需）
++            const executablePath = process.env.CHROME_PATH?.trim() || undefined
++
++            // MRS_LOW_MEMORY=1: 低内存设备（<=2GB）追加省内存参数
++            const lowMemoryArgs =
++                process.env.MRS_LOW_MEMORY === '1'
++                    ? [
++                          '--disable-gpu',
++                          '--disable-software-rasterizer',
++                          '--disable-extensions',
++                          '--disable-features=Translate,MediaRouter,OptimizationHints,AcceptCHFrame'
++                      ]
++                    : []
++
++            // MRS_CHROME_ARGS: 任意追加参数，空格分隔（调试 32 位/低内存环境用）
++            const extraArgs = (process.env.MRS_CHROME_ARGS ?? '')
++                .split(/\s+/)
++                .map(arg => arg.trim())
++                .filter(Boolean)
++
+             if (ignoreCertificateErrors) {
+                 this.bot.logger.warn(
+                     this.bot.isMobile,
+@@ -108,14 +128,15 @@
+                 'BROWSER',
+                 useRealEdge
+                     ? `正在启动真实 Edge (channel=msedge) | headless=${headless} | platform=${process.platform} | proxy=${hasProxy ? 'yes' : 'no'} | tls=${ignoreCertificateErrors ? 'verification-disabled' : 'verified'}`
+-                    : `正在启动内置的补丁版 Chromium (Edge UA) | headless=${headless} | platform=${process.platform} | proxy=${hasProxy ? 'yes' : 'no'} | tls=${ignoreCertificateErrors ? 'verification-disabled' : 'verified'} | sandbox=${sandboxDisabled ? 'disabled-root' : 'enabled'}`
++                    : `正在启动内置的补丁版 Chromium (Edge UA) | headless=${headless} | platform=${process.platform} | proxy=${hasProxy ? 'yes' : 'no'} | tls=${ignoreCertificateErrors ? 'verification-disabled' : 'verified'} | sandbox=${sandboxDisabled ? 'disabled-root' : 'enabled'} | bin=${executablePath ?? 'bundled'}`
+             )
+ 
+             browser = await rebrowser.chromium.launch({
+                 headless,
+                 ...(useRealEdge && { channel: 'msedge' as const }),
++                ...(executablePath && { executablePath }),
+                 ...(proxyConfig && { proxy: proxyConfig }),
+-                args: [...Browser.BROWSER_ARGS, ...sandboxArgs, ...certArgs]
++                args: [...Browser.BROWSER_ARGS, ...sandboxArgs, ...certArgs, ...lowMemoryArgs, ...extraArgs]
+             })
+         } catch (error) {
+             const errorMessage = error instanceof Error ? error.message : String(error)
+--- a/src/browser/BrowserFunc.ts	2026-09-14 10:22:10.000000000 +0800
++++ b/src/browser/BrowserFunc.ts	2026-09-25 10:40:55.000000000 +0800
+@@ -1,7 +1,9 @@
++import { createHash } from 'node:crypto'
++
+ import { URLs } from '../constants/urls'
+ import { BING_APP_USER_AGENT } from '../constants/userAgents'
+ import type { BrowserContext, Cookie, Page } from 'patchright'
+-import type { HttpRequestConfig } from '../util/Http'
++import type { BrowserBridgeFetch, BrowserBridgeResult, HttpRequestConfig } from '../util/Http'
+ 
+ import type { MicrosoftRewardsBot } from '../index'
+ import type { PageSnapshot, ParsedOffer } from './ReactFunc'
+@@ -14,6 +16,47 @@
+ import type { AppDashboardData } from '../interface/AppDashBoardData'
+ import { detectFlyoutBotWarning, mapFlyoutToDashboard, type RewardsFlyoutData } from './FlyoutDashboard'
+ 
++/**
++ * 搜索计分链路上的关键 Cookie。
++ * group 说明它归属于哪个域簇，便于判断"搜索请求到底带没带身份"。
++ */
++const SEARCH_KEY_COOKIES: ReadonlyArray<{ name: string; group: 'rewards' | 'bing' | 'live' }> = [
++    { name: '_C_Auth', group: 'rewards' },
++    { name: 'tifacfaatcs', group: 'rewards' },
++    { name: 'MSFPC', group: 'rewards' },
++    { name: 'SRCHHPGUSR', group: 'bing' },
++    { name: 'SRCHUSR', group: 'bing' },
++    { name: '_EDGE_V', group: 'bing' },
++    { name: '_EDGE_S', group: 'bing' },
++    { name: 'MUID', group: 'bing' },
++    { name: 'ANON', group: 'bing' },
++    { name: 'WLS', group: 'bing' },
++    { name: '.MSA.Auth', group: 'bing' },
++    { name: 'MSPRequ', group: 'live' },
++    { name: 'MSPOK', group: 'live' },
++    { name: 'MSPAuth', group: 'live' },
++    { name: 'WLSSC', group: 'live' }
++]
++
++export interface SearchCookieSnapshot {
++    platform: 'MOBILE' | 'DESKTOP'
++    account: string
++    cacheSource: string
++    cachedCount: number
++    liveCount: number | null
++    inSync: boolean | null
++    /** 只在缓存里存在、浏览器实时态已没有的 Cookie 数（陈旧项，不影响结论但有提示价值） */
++    cacheOnlyCount: number
++    owner: string
++    ownerMatches: boolean
++    rewardsCount: number
++    bingCount: number
++    present: string[]
++    missing: string[]
++    fingerprint: string
++    dashboardSource: 'primary' | 'flyout'
++}
++
+ export default class BrowserFunc {
+     private bot: MicrosoftRewardsBot
+ 
+@@ -21,22 +64,241 @@
+ 
+     private useFlyoutDashboardFallback = false
+ 
++    /**
++     * 降级到 flyout 后，下一次允许重新探测主接口的时间戳(ms)。
++     *
++     * 主接口偶发失败（设备网络抖动、上下文刚建立）不应该让整轮运行永久失去主接口：
++     * 一旦置真就再也不回退，后面所有 dashboard 取数都只能靠 flyout 那份残缺数据。
++     */
++    private primaryReprobeAt = 0
++
++    /** 重新探测主接口的间隔（10 分钟） */
++    private static readonly PRIMARY_REPROBE_MS = 10 * 60 * 1000
++
++    /** Bing flyout 兜底的最大尝试次数（应对 ERR_CONNECTION_RESET 之类的瞬时错误） */
++    private static readonly FLYOUT_MAX_ATTEMPTS = 3
++
+     private botMetricsLoggedPlatforms = new Set<string>()
+ 
++    private bridgePage: Page | null = null
++
++    /** 审计用：上一次记录 cookies 指纹时的账户/平台，用于判断账户切换后是否同步 */
++    private cookieAuditTrail: { account: string; platform: string; fingerprint: string } | null = null
++
++    /** 审计用：(账户|平台) → 登录票据身份标识，用于跨轮次判断是否串号 */
++    private cookieOwnerTrail = new Map<string, string>()
++
+     constructor(bot: MicrosoftRewardsBot) {
+         this.bot = bot
+     }
+ 
++    /**
++     * 构造浏览器桥接函数（armv7l 等无 impit 平台的取数通道）。
++     *
++     * 背景：impit 只提供 x86_64 / aarch64 预编译包，armv7l 上 HTTP 层会回落到
++     * undici，TLS/HTTP2 指纹与浏览器不一致，微软对 rewards.bing.com 的请求会
++     * 返回登录页（flyout 则降级成 isRewardsUser:false 的匿名响应）。
++     *
++     * 关键点：直接用页面内 fetch 打 /api/getuserinfo 会失败 —— 会话里必须先有
++     * 服务端下发的 tifacfaatcs cookie，否则接口会把请求 302 到 login.live.com，
++     * 跨域重定向被 CORS 拦下，表现就是 "Failed to fetch"。
++     * 该 cookie 只有在「顶层导航」到接口时才会下发，因此这里：
++     *   1) 先用专用页面做一次顶层导航预热；
++     *   2) 之后改用页面内 fetch 复用真实浏览器网络栈（快且不打断主页面）。
++     */
++    createBrowserBridge(): BrowserBridgeFetch {
++        return async (url, init) => {
++            // 只有纯文本 / 无 body 的请求能安全地在页面里重放
++            const body = init.body
++            if (body !== undefined && body !== null && typeof body !== 'string') return null
++
++            const method = (init.method ?? 'GET').toUpperCase()
++
++            try {
++                new URL(url)
++            } catch {
++                return null
++            }
++
++            const page = await this.ensureBridgePage()
++            if (!page) return null
++
++            const attempt = async (): Promise<BrowserBridgeResult | null> => {
++                try {
++                    const result = await page.evaluate(
++                        async ({ requestUrl, requestMethod, headers, requestBody }) => {
++                            const forbidden = new Set([
++                                'cookie',
++                                'host',
++                                'origin',
++                                'referer',
++                                'content-length',
++                                'connection',
++                                'accept-encoding',
++                                'via',
++                                'proxy-authorization'
++                            ])
++                            const clean: Record<string, string> = {}
++
++                            for (const [key, value] of Object.entries(headers ?? {})) {
++                                if (forbidden.has(key.toLowerCase())) continue
++                                if (value === undefined || value === null) continue
++                                clean[key] = String(value)
++                            }
++
++                            const response = await fetch(requestUrl, {
++                                method: requestMethod,
++                                headers: clean,
++                                body: requestBody,
++                                credentials: 'include',
++                                redirect: 'follow'
++                            })
++
++                            return {
++                                status: response.status,
++                                statusText: response.statusText,
++                                text: await response.text()
++                            }
++                        },
++                        {
++                            requestUrl: url,
++                            requestMethod: method,
++                            headers: init.headers,
++                            requestBody: body as string | undefined
++                        }
++                    )
++
++                    return result && typeof result.text === 'string' ? result : null
++                } catch {
++                    return null
++                }
++            }
++
++            // 1) 快路径：已经预热过的源，直接页面内 fetch
++            const direct = await attempt()
++            if (direct) {
++                this.bot.logger.debug(
++                    this.bot.isMobile,
++                    'HTTP-BRIDGE',
++                    `${method} ${url} -> ${direct.status} | 长度=${direct.text.length}`
++                )
++                return direct
++            }
++
++            // 2) 预热：顶层导航一次，让服务端下发会话 cookie（仅 GET 安全）
++            if (method !== 'GET') return null
++
++            const target = new URL(url)
++            const targetOrigin = target.origin
++
++            try {
++                // 先在该源上"落地"一次：新上下文（例如刚登录的桌面端）直接打接口会被
++                // 判定为未登录而重定向到登录页，必须先加载一个常规页面建立会话。
++                const pageOrigin = page.url() && page.url() !== 'about:blank' ? new URL(page.url()).origin : ''
++                if (pageOrigin !== targetOrigin) {
++                    try {
++                        await page.goto(`${targetOrigin}/`, { waitUntil: 'commit', timeout: 30000 })
++                    } catch {
++                        /* 落地失败不致命，继续尝试直接导航 */
++                    }
++                }
++
++                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 })
++            } catch (error) {
++                this.bot.logger.debug(
++                    this.bot.isMobile,
++                    'HTTP-BRIDGE',
++                    `预热导航失败 | ${error instanceof Error ? error.message : String(error)}`
++                )
++                return null
++            }
++
++            const primed = await attempt()
++            if (primed) {
++                this.bot.logger.debug(
++                    this.bot.isMobile,
++                    'HTTP-BRIDGE',
++                    `预热后 ${method} ${url} -> ${primed.status} | 长度=${primed.text.length}`
++                )
++                return primed
++            }
++
++            // 3) 最后兜底：直接读顶层导航渲染出来的响应体（只在看起来像真正的响应时采用）
++            try {
++                const text = (await page.evaluate(() => document.body?.textContent ?? '')).trim()
++                const looksLikePayload = text.startsWith('{') || text.startsWith('[') || text.length > 20000
++
++                if (text && looksLikePayload) {
++                    this.bot.logger.debug(
++                        this.bot.isMobile,
++                        'HTTP-BRIDGE',
++                        `读取导航响应体 ${method} ${url} | 长度=${text.length}`
++                    )
++                    return { status: 200, statusText: 'OK', text }
++                }
++
++                this.bot.logger.debug(
++                    this.bot.isMobile,
++                    'HTTP-BRIDGE',
++                    `预热后仍无法取得有效响应，回落普通后端 | 长度=${text.length}`
++                )
++            } catch {
++                /* 忽略 */
++            }
++
++            return null
++        }
++    }
++
++    /** 惰性创建专用于 API 取数的页面，避免打断主页面（搜索 / 活动）的浏览状态 */
++    private async ensureBridgePage(): Promise<Page | null> {
++        const active = this.getActivePage()
++        if (!active) return null
++
++        try {
++            if (this.bridgePage && !this.bridgePage.isClosed() && this.bridgePage.context() === active.context()) {
++                return this.bridgePage
++            }
++        } catch {
++            this.bridgePage = null
++        }
++
++        try {
++            const page = await active.context().newPage()
++            await page.goto('about:blank')
++            this.bridgePage = page
++            return page
++        } catch (error) {
++            this.bot.logger.debug(
++                this.bot.isMobile,
++                'HTTP-BRIDGE',
++                `无法创建专用取数页面 | ${error instanceof Error ? error.message : String(error)}`
++            )
++            return null
++        }
++    }
++
+     async getDashboardData(cookies?: Cookie[]): Promise<DashboardData> {
+         const fingerprintHeaders = { ...(this.bot.fingerprint?.headers ?? {}) }
+         delete fingerprintHeaders['Cookie']
+         delete fingerprintHeaders['cookie']
+ 
+-        if (!this.useFlyoutDashboardFallback) {
++        // 已降级时也要定期回探主接口：网络恢复后自动切回完整仪表板
++        const canProbePrimary = !this.useFlyoutDashboardFallback || Date.now() >= this.primaryReprobeAt
++
++        if (canProbePrimary) {
+             let primaryError: unknown
+ 
+             for (let attempt = 1; attempt <= 2; attempt++) {
+                 try {
++                    // 审计：记录本次主接口请求实际携带的 Cookie（来源/关键字段/归属/指纹）
++                    await this.captureSearchCookieSnapshot(
++                        'DASHBOARD-PRIMARY',
++                        URLs.rewards.userInfoApi,
++                        'primary',
++                        attempt === 1
++                    )
++
+                     const response = await this.bot.http.request<DashboardData>({
+                         url: URLs.rewards.userInfoApi,
+                         method: 'GET',
+@@ -52,7 +314,16 @@
+                     await this.applyResponseCookies(URLs.rewards.userInfoApi, response.headers['set-cookie'])
+ 
+                     if (response.data?.dashboard) {
+-                        this.logBotDetectionMetrics(response.data)
++                        this.logBotDetectionMetrics(response.data, 'primary')
++                        if (this.useFlyoutDashboardFallback) {
++                            this.bot.logger.info(
++                                this.bot.isMobile,
++                                'GET-DASHBOARD-DATA',
++                                '主接口已恢复，切回完整仪表板'
++                            )
++                        }
++                        this.useFlyoutDashboardFallback = false
++                        this.primaryReprobeAt = 0
+                         return response.data
+                     }
+                     throw new Error('Dashboard data missing from API response')
+@@ -70,10 +341,11 @@
+             }
+ 
+             this.useFlyoutDashboardFallback = true
++            this.primaryReprobeAt = Date.now() + BrowserFunc.PRIMARY_REPROBE_MS
+             this.bot.logger.warn(
+                 this.bot.isMobile,
+                 'GET-DASHBOARD-DATA',
+-                `重试后主接口仍不可用，改用 Bing flyout 兜底 | 信息=${this.errorMessage(primaryError)}`
++                `重试后主接口仍不可用，改用 Bing flyout 兜底（10 分钟后回探） | 信息=${this.errorMessage(primaryError)}`
+             )
+         }
+ 
+@@ -84,45 +356,120 @@
+         cookies: Cookie[] | undefined,
+         fingerprintHeaders: Record<string, string>
+     ): Promise<DashboardData> {
+-        try {
+-            const response = await this.bot.http.request<RewardsFlyoutData>({
+-                url: URLs.bing.rewardsFlyoutUserInfo,
+-                method: 'GET',
+-                headers: {
+-                    ...fingerprintHeaders,
+-                    Accept: 'application/json',
+-                    Cookie: this.buildCookieHeader(this.getCachedCookies(cookies, URLs.bing.rewardsFlyoutUserInfo)),
+-                    Referer: `${URLs.bing.origin}/`,
+-                    Origin: URLs.bing.origin
+-                },
+-                retries: 0
+-            })
++        let lastError: unknown
+ 
+-            await this.applyResponseCookies(URLs.bing.rewardsFlyoutUserInfo, response.headers['set-cookie'])
++        for (let attempt = 1; attempt <= BrowserFunc.FLYOUT_MAX_ATTEMPTS; attempt++) {
++            try {
++                const response = await this.bot.http.request<RewardsFlyoutData>({
++                    url: URLs.bing.rewardsFlyoutUserInfo,
++                    method: 'GET',
++                    headers: {
++                        ...fingerprintHeaders,
++                        Accept: 'application/json',
++                        Cookie: this.buildCookieHeader(this.getCachedCookies(cookies, URLs.bing.rewardsFlyoutUserInfo)),
++                        Referer: `${URLs.bing.origin}/`,
++                        Origin: URLs.bing.origin
++                    },
++                    retries: 0
++                })
+ 
+-            const detection = detectFlyoutBotWarning(response.data)
+-            this.bot.logger.warn(
+-                this.bot.isMobile,
+-                'GET-DASHBOARD-DATA',
+-                `使用 Bing flyout 部分仪表板 | 疑似受限=${detection.likelyLimited} | bot标记=${detection.hasBotProfileMarkers} | 活动折叠=${detection.hasCollapsedActivities}`
+-            )
+-            const mappedDashboard = mapFlyoutToDashboard(response.data)
+-            this.logBotDetectionMetrics(mappedDashboard)
+-            return mappedDashboard
+-        } catch (error) {
+-            this.bot.logger.error(
+-                this.bot.isMobile,
+-                'GET-DASHBOARD-DATA',
+-                `获取仪表板数据失败（主接口与 Bing flyout 兜底均失败）: ${this.errorMessage(error)}`
+-            )
+-            throw error
++                await this.applyResponseCookies(URLs.bing.rewardsFlyoutUserInfo, response.headers['set-cookie'])
++
++                const detection = detectFlyoutBotWarning(response.data)
++                this.bot.logger.warn(
++                    this.bot.isMobile,
++                    'GET-DASHBOARD-DATA',
++                    `使用 Bing flyout 部分仪表板 | 疑似受限=${detection.likelyLimited} | bot标记=${detection.hasBotProfileMarkers} | 活动折叠=${detection.hasCollapsedActivities}`
++                )
++                // 审计：主接口已弃用，记录降级到 flyout 时的 Cookie 状态
++                await this.captureSearchCookieSnapshot(
++                    'DASHBOARD-FLYOUT',
++                    URLs.bing.rewardsFlyoutUserInfo,
++                    'flyout',
++                    true
++                )
++                const mappedDashboard = mapFlyoutToDashboard(response.data)
++                this.logBotDetectionMetrics(mappedDashboard, 'flyout')
++                return mappedDashboard
++            } catch (error) {
++                lastError = error
++
++                if (attempt < BrowserFunc.FLYOUT_MAX_ATTEMPTS) {
++                    const backoffMs = attempt * 3000
++                    this.bot.logger.warn(
++                        this.bot.isMobile,
++                        'GET-DASHBOARD-DATA',
++                        `Bing flyout 第 ${attempt}/${BrowserFunc.FLYOUT_MAX_ATTEMPTS} 次失败，${backoffMs / 1000}s 后重试 | 信息=${this.errorMessage(error)}`
++                    )
++                    await new Promise(resolve => setTimeout(resolve, backoffMs))
++                }
++            }
++        }
++
++        this.bot.logger.error(
++            this.bot.isMobile,
++            'GET-DASHBOARD-DATA',
++            `获取仪表板数据失败（主接口与 Bing flyout 兜底均失败，flyout 已重试 ${BrowserFunc.FLYOUT_MAX_ATTEMPTS} 次）: ${this.errorMessage(lastError)}`
++        )
++        throw lastError
++    }
++
++    /**
++     * 解析 serpbotscore。
++     *
++     * getuserinfo 单次返回里该字段会出现在两处，实测（/tmp/getuserinfo.json 全量键枚举）
++     * 两处值完全一致：
++     *   - $.dashboard.userProfile.attributes.serpbotscore
++     *   - $.profile.attributes.serpbotscore
++     * 原因是 FlyoutDashboard.mapFlyoutToDashboard() 里 `dashboard.userProfile = profile`，
++     * 两者同源，不存在"不同账户取到不同值"的歧义。因此优先取 dashboard.userProfile，
++     * 兜底取 profile，并兼容 Flyout 侧的大小写写法 SerpBotScore / SerpBotScore_upd。
++     *
++     * 取不到时要区分两种情况，不能一律回退成「未知」：
++     *   - 走 flyout 匿名兜底（isRewardsUser:false）时响应里根本没有 profile → 匿名兜底；
++     *   - profile 有返回但属性里没这个字段 → 接口未下发。
++     */
++    private resolveSerpBotScore(data: DashboardData): {
++        score: string | null
++        updated: string | null
++        path: string
++        reason: string | null
++    } {
++        const candidates: Array<{ path: string; attributes: unknown }> = [
++            { path: 'dashboard.userProfile.attributes', attributes: data.dashboard?.userProfile?.attributes },
++            { path: 'profile.attributes', attributes: data.profile?.attributes }
++        ]
++
++        for (const candidate of candidates) {
++            const attributes = candidate.attributes as Record<string, unknown> | undefined
++            if (!attributes) continue
++
++            const rawScore = attributes.serpbotscore ?? attributes.SerpBotScore
++            const rawUpdated = attributes.serpbotscore_upd ?? attributes.SerpBotScore_upd
++
++            if (rawScore !== undefined && rawScore !== null && rawScore !== '') {
++                return {
++                    score: String(rawScore),
++                    updated: rawUpdated === undefined || rawUpdated === null ? null : String(rawUpdated),
++                    path: candidate.path,
++                    reason: null
++                }
++            }
++        }
++
++        const hasProfile = Boolean(data.dashboard?.userProfile ?? data.profile)
++        return {
++            score: null,
++            updated: null,
++            path: '无',
++            reason: hasProfile
++                ? '字段缺失(profile已返回但未含serpbotscore)'
++                : '字段缺失(flyout匿名兜底:未返回profile)'
+         }
+     }
+ 
+-    private logBotDetectionMetrics(data: DashboardData): void {
+-        const attributes = data.profile?.attributes as unknown as Record<string, unknown> | undefined
+-        const score = attributes?.serpbotscore ?? attributes?.SerpBotScore
+-        const scoreUpdated = attributes?.serpbotscore_upd ?? attributes?.SerpBotScore_upd
++    private logBotDetectionMetrics(data: DashboardData, source: 'primary' | 'flyout' = 'primary'): void {
++        const resolved = this.resolveSerpBotScore(data)
+         const warningNames = (data.dashboard?.userWarnings ?? [])
+             .map(warning => warning?.name)
+             .filter((name): name is string => Boolean(name))
+@@ -131,8 +478,8 @@
+         this.botMetricsLoggedPlatforms.add(platform)
+ 
+         const message =
+-            `机器人检测指标 | serpbotscore=${score ?? '未知'} | 更新时间=${
+-                scoreUpdated ? String(scoreUpdated).slice(0, 16) : '未知'
++            `机器人检测指标 | serpbotscore=${resolved.score ?? resolved.reason ?? '未知'} | 更新时间=${
++                resolved.updated ? String(resolved.updated).slice(0, 16) : '未知'
+             } | userWarnings=${warningNames.length > 0 ? warningNames.join(', ') : '无'}`
+ 
+         if (warningNames.length > 0) {
+@@ -142,12 +489,230 @@
+         } else {
+             this.bot.logger.debug(this.bot.isMobile, 'GET-DASHBOARD-DATA', message)
+         }
++
++        // 取值来源单独以 debug 输出，避免改动上面指标行的结构与字段名
++        this.bot.logger.debug(
++            this.bot.isMobile,
++            'GET-DASHBOARD-DATA',
++            `serpbotscore 取值 | 数据源=${source} | 平台=${platform} | 路径=${resolved.path} | 分数=${
++                resolved.score ?? '未解析'
++            } | 更新时间=${resolved.updated ?? '未解析'}`
++        )
+     }
+ 
+     private errorMessage(error: unknown): string {
+         return error instanceof Error ? error.message : String(error)
+     }
+ 
++    /**
++     * 从登录票据里提取身份标识，用于跨轮次判断是否换成了别人的票据（串号）。
++     * 优先级：WLS 的 cid → MSPRequ 的 id → .MSA.Auth 前缀 → MUID 前缀。
++     */
++    private extractCookieOwner(cookies: Cookie[]): string | null {
++        const valueOf = (name: string): string | undefined => cookies.find(cookie => cookie.name === name)?.value
++        const fieldOf = (value: string | undefined, key: string): string | null => {
++            if (!value) return null
++            const match = new RegExp(`(?:^|[&;])${key}=([^&;]+)`).exec(value)
++            return match?.[1] ?? null
++        }
++
++        const cid = fieldOf(valueOf('WLS'), 'cid')
++        if (cid) return `cid=${cid.slice(0, 12)}`
++
++        const mspId = fieldOf(valueOf('MSPRequ'), 'id')
++        if (mspId) return `MSPRequ=${mspId.slice(0, 12)}`
++
++        const msa = valueOf('.MSA.Auth')
++        if (msa) return `MSA=${msa.slice(0, 12)}`
++
++        const muid = valueOf('MUID')
++        if (muid) return `MUID=${muid.slice(0, 12)}`
++
++        return null
++    }
++
++    /**
++     * 同一账户同一平台的登录票据身份在多轮之间应保持一致；首次采集视为一致。
++     * 按「账户|平台」分别记录 —— 移动端与桌面端的票据种类不同（一个有 .MSA.Auth、
++     * 一个只有 MUID），混在一起比会误报串号。
++     */
++    private checkCookieOwnerMatches(account: string, platform: string, owner: string | null): boolean {
++        if (!owner) return false
++        const key = `${account}|${platform}`
++        const previous = this.cookieOwnerTrail.get(key)
++        this.cookieOwnerTrail.set(key, owner)
++        return previous === undefined || previous === owner
++    }
++
++    /**
++     * 采集一次 Cookie 快照（搜索计分链路审计用）。
++     *
++     * 回答四个问题：
++     *   1) 来源 —— 请求实际携带的 Cookie 来自会话缓存（cache）还是浏览器 context 实时态（live），两者是否同步；
++     *   2) 关键字段 —— Rewards 计分依赖的身份 Cookie 是否齐全；
++     *   3) 账户同步 —— 账户 / 平台切换后 Cookie 指纹有没有跟着更新；
++     *   4) 归属 —— 登录票据的身份标识在多轮之间是否稳定（防止串号）。
++     *
++     * 日志策略：只有「首次采集」「指纹变化」「force=true」时才输出 info 行，其余走 debug，
++     * 避免每次搜索都刷屏。
++     */
++    async captureSearchCookieSnapshot(
++        source: string,
++        targetUrl: string = URLs.bing.origin,
++        dashboardSource: 'primary' | 'flyout' = 'primary',
++        force = false,
++        liveOverride?: Cookie[]
++    ): Promise<SearchCookieSnapshot | null> {
++        const platform: 'MOBILE' | 'DESKTOP' = this.bot.isMobile ? 'MOBILE' : 'DESKTOP'
++        const account = this.bot.currentAccountEmail || '未知账户'
++
++        let cached: Cookie[] = []
++        try {
++            cached = this.getCachedCookies(undefined, targetUrl)
++        } catch {
++            cached = []
++        }
++
++        let live: Cookie[] | null = null
++        if (liveOverride) {
++            live = this.filterCookiesForUrl(liveOverride, targetUrl)
++        } else {
++            const page = this.getActivePage()
++            if (page) {
++                try {
++                    live = this.filterCookiesForUrl(await page.context().cookies(), targetUrl)
++                } catch {
++                    live = null
++                }
++            }
++        }
++
++        // buildCookieHeader 实际带上的是缓存集；缓存为空时才退化为实时集
++        const effective = cached.length > 0 ? cached : live ?? []
++        const byName = new Map<string, Cookie>()
++        for (const cookie of effective) {
++            if (!byName.has(cookie.name)) byName.set(cookie.name, cookie)
++        }
++
++        const present: string[] = []
++        const missing: string[] = []
++        let rewardsCount = 0
++        let bingCount = 0
++        for (const { name, group } of SEARCH_KEY_COOKIES) {
++            if (byName.has(name)) {
++                present.push(name)
++                if (group === 'rewards') rewardsCount++
++                else if (group === 'bing') bingCount++
++            } else {
++                missing.push(name)
++            }
++        }
++
++        const fingerprint = createHash('sha1')
++            .update(
++                effective
++                    .map(cookie => `${cookie.domain}|${cookie.path}|${cookie.name}|${cookie.value}`)
++                    .sort()
++                    .join('\n')
++            )
++            .digest('hex')
++            .slice(0, 12)
++
++        const owner = this.extractCookieOwner(effective)
++        const ownerMatches = this.checkCookieOwnerMatches(account, platform, owner)
++
++        // 同步判定只看「同名 Cookie 的值有没有冲突」：
++        // 缓存里多出几条浏览器已删掉的陈旧项不影响计分，因此不计入不同步，只单独统计。
++        let inSync: boolean | null = null
++        let cacheOnlyCount = 0
++        if (live) {
++            const liveByKey = new Map(live.map(cookie => [`${cookie.domain}|${cookie.name}`, cookie.value]))
++            const conflicting = cached.filter(
++                cookie =>
++                    liveByKey.has(`${cookie.domain}|${cookie.name}`) &&
++                    liveByKey.get(`${cookie.domain}|${cookie.name}`) !== cookie.value
++            )
++            cacheOnlyCount = cached.filter(cookie => !liveByKey.has(`${cookie.domain}|${cookie.name}`)).length
++            inSync = conflicting.length === 0
++        }
++
++        const snapshot: SearchCookieSnapshot = {
++            platform,
++            account,
++            cacheSource: source,
++            cachedCount: cached.length,
++            liveCount: live ? live.length : null,
++            inSync,
++            cacheOnlyCount,
++            owner: owner ?? '无',
++            ownerMatches,
++            rewardsCount,
++            bingCount,
++            present,
++            missing,
++            fingerprint,
++            dashboardSource
++        }
++
++        // 与上一次采集比对，判断「账户切换后是否同步更新」
++        const previous = this.cookieAuditTrail
++        let changeNote = '首次采集'
++        if (previous) {
++            if (previous.account !== account && previous.platform !== platform) {
++                changeNote =
++                    fingerprint !== previous.fingerprint ? '账户+平台切换:已同步更新' : '账户+平台切换:未同步(指纹未变)'
++            } else if (previous.account !== account) {
++                changeNote = fingerprint !== previous.fingerprint ? '账户切换:已同步更新' : '账户切换:未同步(指纹未变)'
++            } else if (previous.platform !== platform) {
++                changeNote = fingerprint !== previous.fingerprint ? '平台切换:已切换Cookie集' : '平台切换:指纹相同'
++            } else {
++                changeNote = fingerprint !== previous.fingerprint ? '同账户:指纹已刷新' : '同账户:指纹稳定'
++            }
++        }
++        this.cookieAuditTrail = { account, platform, fingerprint }
++
++        const detail =
++            `Cookie 快照 | 来源=${source} | 账户=${account} | 平台=${platform} | 缓存=${cached.length} | 实时=${
++                live ? live.length : '不可用'
++            } | 缓存与浏览器同步=${inSync === null ? '未知' : inSync ? '是' : '否'} | 缓存陈旧项=${cacheOnlyCount} | 身份=${
++                owner ?? '无'
++            } | 归属一致=${ownerMatches ? '是' : '否'} | rewards关键=${rewardsCount}/3 | bing关键=${bingCount}/8 | 缺失=${
++                missing.length ? missing.join(',') : '无'
++            } | 指纹=${fingerprint} | 比对=${changeNote} | 仪表板=${dashboardSource}`
++
++        if (force || !previous || previous.fingerprint !== fingerprint) {
++            this.bot.logger.info(this.bot.isMobile, 'COOKIE-AUDIT', detail)
++        } else {
++            this.bot.logger.debug(this.bot.isMobile, 'COOKIE-AUDIT', detail)
++        }
++
++        return snapshot
++    }
++
++    /**
++     * 依据 Cookie 快照判定「本轮未获得积分」是不是 Cookie 引起的。
++     * 供搜索流程在 gained === 0 时调用，直接给出可读结论。
++     */
++    explainZeroPoints(snapshot: SearchCookieSnapshot | null): string {
++        if (!snapshot) return '结论=无法判定(未取到 Cookie 快照)'
++
++        const identity = snapshot.present.filter(name => name === '_C_Auth' || name === 'tifacfaatcs')
++        if (identity.length === 0) {
++            return `结论=是(Cookie 失效导致): 缺少 Rewards 身份票据(${
++                snapshot.missing.join(',') || '无'
++            })，请求会被服务端判为未登录`
++        }
++        if (snapshot.inSync === false) {
++            return '结论=疑似(Cookie 失效导致): 会话缓存与浏览器实时 Cookie 存在同名但值不同的票据，请求携带的可能是过期票据'
++        }
++        if (!snapshot.ownerMatches) {
++            return `结论=疑似(串号): 登录票据身份(${snapshot.owner})与该账户历史记录不一致`
++        }
++        return `结论=否(非 Cookie 导致): 身份票据齐全(${identity.join(',')})，且与浏览器实时态一致${
++            snapshot.cacheOnlyCount > 0 ? `（另有 ${snapshot.cacheOnlyCount} 条陈旧缓存项，不影响计分）` : ''
++        }，0 积分另有原因（当日额度已用尽 / 服务端计分延迟 / 接口判定未计分）`
++    }
++
+     async getAppDashboardData(): Promise<AppDashboardData> {
+         try {
+             const request: HttpRequestConfig = {
+@@ -669,6 +1234,16 @@
+             }
+ 
+             this.updateCookieCache(liveCookies, source)
++
++            // 审计：搜索请求打向 bing.com，按该目标记录一次快照（复用刚取到的实时 Cookie，避免重复 IPC）
++            await this.captureSearchCookieSnapshot(
++                source,
++                URLs.bing.origin,
++                this.useFlyoutDashboardFallback ? 'flyout' : 'primary',
++                false,
++                liveCookies
++            )
++
+             return true
+         } catch (error) {
+             this.bot.logger.debug(
+--- a/src/browser/FlyoutDashboard.ts	2026-09-14 10:22:10.000000000 +0800
++++ b/src/browser/FlyoutDashboard.ts	2026-09-25 10:41:26.000000000 +0800
+@@ -114,8 +114,7 @@
+     const flyoutStatus = flyout?.userStatus
+ 
+     if (data.isError || !userInfo?.isRewardsUser || !profile || !flyout || !flyoutStatus?.isRewardsUser) {
+-        const message = data.errorMessage ?? userInfo?.errorMessage ?? 'Flyout response is missing Rewards account data'
+-        throw new Error(message)
++        throw new Error(buildFlyoutRejectionMessage(data))
+     }
+ 
+     const counters = flyoutStatus.counters ?? {}
+@@ -161,6 +160,44 @@
+     } as DashboardData
+ }
+ 
++/**
++ * 把「Flyout 响应不是有效的 Rewards 账户数据」拆成可读的具体原因。
++ *
++ * 原实现只抛一句笼统文案，无法区分下面几种完全不同的故障：
++ *   - isError=true          : 接口主动报错
++ *   - isRewardsUser=false   : 登录态无效 / 账号没开通 Rewards（最常见：缺 tifacfaatcs 票据）
++ *   - profile / flyoutResult 缺失 : 响应结构变了，或被拦到了匿名页
++ */
++function buildFlyoutRejectionMessage(data: RewardsFlyoutData): string {
++    const userInfo = data.userInfo
++    const flyout = data.flyoutResult
++    const reasons: string[] = []
++
++    if (data.isError) {
++        reasons.push(`isError=true(${data.errorMessage ?? '无错误信息'})`)
++    }
++    if (!userInfo) {
++        reasons.push('userInfo 缺失')
++    } else if (!userInfo.isRewardsUser) {
++        reasons.push(
++            `userInfo.isRewardsUser=false(errorCode=${userInfo.errorCode ?? 'n/a'}${userInfo.errorMessage ? ` | ${userInfo.errorMessage}` : ''})`
++        )
++    }
++    if (!userInfo?.profile) {
++        reasons.push('userInfo.profile 缺失')
++    }
++    if (!flyout) {
++        reasons.push('flyoutResult 缺失')
++    } else if (!flyout.userStatus?.isRewardsUser) {
++        reasons.push('flyoutResult.userStatus.isRewardsUser=false')
++    }
++
++    const topKeys = Object.keys(data ?? {})
++    const keys = topKeys.length ? topKeys.join(',') : '(空对象)'
++
++    return `Flyout 响应不是有效的 Rewards 账户数据 | 原因=${reasons.length ? reasons.join('; ') : '未知'} | 顶层键=${keys}`
++}
++
+ function sumCounterMaximum(counters?: Array<{ pointProgressMax: number }>): number | null {
+     if (!counters?.length) return null
+     return counters.reduce((total, counter) => total + Math.max(0, Number(counter.pointProgressMax) || 0), 0)
+--- a/src/browser/auth/Login.ts	2026-09-14 10:22:10.000000000 +0800
++++ b/src/browser/auth/Login.ts	2026-09-25 10:50:44.000000000 +0800
+@@ -54,6 +54,17 @@
+     private signInMethodsLogged = false
+     private passwordlessMethodSelected = false
+ 
++    /**
++     * 重新换取 Rewards 票据的次数。
++     *
++     * 场景：恢复的旧会话让 URL 落在 rewards.bing.com/dashboard 上，旧逻辑只看主机名就
++     * 「假设已登录」，但服务端从未下发 Rewards 登录票据（tifacfaatcs）。结果是
++     * /api/getuserinfo 拿到登录页、flyout 拿到匿名响应，dashboard 全线失败。
++     * 这里主动回 /auth/login 重新换取票据；超过上限后退回原行为，避免登录流程卡死。
++     */
++    private reauthAttempts = 0
++    private static readonly MAX_REAUTH_ATTEMPTS = 3
++
+     private readonly selectors = {
+         primaryButton: 'button[data-testid="primaryButton"]',
+         secondaryButton: 'button[data-testid="secondaryButton"]',
+@@ -94,6 +105,7 @@
+             this.capturedUnknownUrls.clear()
+             this.signInMethodsLogged = false
+             this.passwordlessMethodSelected = false
++            this.reauthAttempts = 0
+             this.bot.logger.info(this.bot.isMobile, 'LOGIN', '开始登录流程')
+ 
+             await page
+@@ -194,7 +206,36 @@
+         }
+ 
+         if (hostname === 'bing.com' || hostname.endsWith('.bing.com') || hostname === 'account.microsoft.com') {
+-            this.bot.logger.debug(this.bot.isMobile, 'DETECT-STATE', '在Bing/奖励/账户页面，假设已登录')
++            if (await this.hasAuthIdentity(page)) {
++                this.bot.logger.debug(
++                    this.bot.isMobile,
++                    'DETECT-STATE',
++                    '在Bing/奖励/账户页面，且已取得登录身份票据，视为已登录'
++                )
++                return 'LOGGED_IN'
++            }
++
++            // URL 看着已登录，但服务端没下发任何身份票据 —— 典型成因是复用了陈旧的
++            // 已保存会话（过期票据被清掉后从未重新换取）。此时 rewards API 会返回登录页。
++            if (this.reauthAttempts < Login.MAX_REAUTH_ATTEMPTS) {
++                this.reauthAttempts++
++                this.bot.logger.warn(
++                    this.bot.isMobile,
++                    'DETECT-STATE',
++                    `在Bing/奖励页面但缺少登录身份票据(.MSA.Auth/tifacfaatcs)，第 ${this.reauthAttempts}/${Login.MAX_REAUTH_ATTEMPTS} 次回 /auth/login 重新换取`
++                )
++                await page
++                    .goto(URLs.rewards.userLogin, { waitUntil: 'domcontentloaded', timeout: 30000 })
++                    .catch(() => {})
++                await this.bot.utils.wait(2000)
++                return 'UNKNOWN'
++            }
++
++            this.bot.logger.warn(
++                this.bot.isMobile,
++                'DETECT-STATE',
++                '重新换取后仍缺少登录身份票据(.MSA.Auth/tifacfaatcs)，按原行为假定已登录（dashboard 可能不可用）'
++            )
+             return 'LOGGED_IN'
+         }
+ 
+@@ -320,6 +361,32 @@
+         return foundStates[0] as LoginState
+     }
+ 
++    /**
++     * 浏览器上下文里是否已有可用的登录身份票据。
++     *
++     * 只看 URL 主机名就判定"已登录"是不可靠的：恢复的陈旧会话同样会把页面停在
++     * rewards.bing.com/dashboard 上，但服务端没下发任何身份票据，于是
++     * /api/getuserinfo 拿到登录页、panelflyout 拿到匿名响应，dashboard 全线失败。
++     *
++     * 判定任一存在的票据即可：
++     *   - .MSA.Auth  : 微软账号鉴权票据，CN 市场账号通常只下发这一个
++     *   - tifacfaatcs: Rewards 专用票据，部分市场/账号额外下发
++     * 只认 tifacfaatcs 会误判——实测 CN 账号主接口完全正常也拿不到它。
++     */
++    private async hasAuthIdentity(page: Page): Promise<boolean> {
++        try {
++            const cookies = await page.context().cookies()
++            return cookies.some(
++                cookie =>
++                    (cookie.name === '.MSA.Auth' || cookie.name === 'tifacfaatcs') &&
++                    String(cookie.value ?? '').length > 0
++            )
++        } catch {
++            // 拿不到 Cookie 时不凭此判定为未登录，交由上层逻辑处理
++            return true
++        }
++    }
++
+     private async checkSelector(page: Page, selector: string): Promise<boolean> {
+         return page
+             .waitForSelector(selector, { state: 'visible', timeout: 5000 })
+--- a/src/functions/activities/search/BrowserSearch.ts	2026-09-14 10:22:10.000000000 +0800
++++ b/src/functions/activities/search/BrowserSearch.ts	2026-09-25 01:38:39.000000000 +0800
+@@ -103,8 +103,12 @@
+             )
+ 
+             await this.bot.browser.func.synchronizeActiveBrowserCookies('SEARCH-COOKIE-SEED', true)
+-            await page.goto(URLs.bing.origin)
+-            await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {})
++            // 审计：会话开始时强制落一条 Cookie 基线（来源/关键字段/指纹/归属）
++            await this.bot.browser.func.captureSearchCookieSnapshot('SEARCH-COOKIE-SEED', URLs.bing.origin, 'primary', true)
++            // 弱设备（RK3229 / armv7l）上等 load 事件常因挂起的第三方资源卡满 90s 导航超时，
++            // 导致整个搜索会话在开场就异常退出（搜索次数=0）。只等 domcontentloaded，
++            // 搜索框是否可用由下面 bingSearch() 里的 waitFor 保证。
++            await page.goto(URLs.bing.origin, { waitUntil: 'domcontentloaded', timeout: 60000 })
+             await this.bot.browser.utils.tryDismissAllMessages(page)
+ 
+             while (!tracker.done() && stats.performed < tracker.maxSearches && stats.stagnant < tracker.stagnantLimit) {
+@@ -136,6 +140,19 @@
+                         tracker.context,
+                         `未获得积分 ${stats.stagnant}/${tracker.stagnantLimit} | 查询="${query}" | ${tracker.progress()}`
+                     )
++
++                    // 审计：未获得积分时，抓取当时的 Cookie 状态并给出"是否 Cookie 导致"的结论
++                    const zeroSnapshot = await this.bot.browser.func.captureSearchCookieSnapshot(
++                        'SEARCH-ZERO-POINTS',
++                        URLs.bing.origin,
++                        'primary',
++                        true
++                    )
++                    this.bot.logger.info(
++                        isMobile,
++                        'SEARCH-COOKIE-AUDIT',
++                        `未获得积分原因排查 | ${this.bot.browser.func.explainZeroPoints(zeroSnapshot)}`
++                    )
+                 }
+             }
+ 
+@@ -153,8 +170,7 @@
+         this.searchCount++
+ 
+         if (this.searchCount % REFRESH_EVERY === 0) {
+-            await page.goto(URLs.bing.origin)
+-            await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {})
++            await page.goto(URLs.bing.origin, { waitUntil: 'domcontentloaded', timeout: 60000 })
+             await this.bot.browser.utils.tryDismissAllMessages(page)
+         }
+ 
+--- a/src/functions/activities/search/BrowserSearchOnBing.ts	2026-09-14 10:22:10.000000000 +0800
++++ b/src/functions/activities/search/BrowserSearchOnBing.ts	2026-09-25 01:39:39.000000000 +0800
+@@ -149,8 +149,8 @@
+         const searchBox = page.locator('#sb_form_q')
+         if (await searchBox.isVisible().catch(() => false)) return
+ 
+-        await page.goto(URLs.bing.origin)
+-        await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {})
++        // 同上：弱设备上只等 domcontentloaded，避免 load 事件卡满导航超时
++        await page.goto(URLs.bing.origin, { waitUntil: 'domcontentloaded', timeout: 60000 })
+         await this.bot.browser.utils.tryDismissAllMessages(page)
+     }
+ 
+--- a/src/index.ts	2026-09-14 10:22:10.000000000 +0800
++++ b/src/index.ts	2026-09-25 10:41:35.000000000 +0800
+@@ -479,7 +479,21 @@
+         hadWorkerFailure: boolean
+     ): Promise<void> {
+         const pushplus = this.config?.webhook?.pushplus
+-        if (!pushplus?.enabled || !pushplus.token) {
++        if (!pushplus?.enabled) {
++            return
++        }
++
++        // 启用却没 token 时不能静默返回 —— 否则"配了推送但一直收不到"完全无迹可寻。
++        if (!pushplus.token) {
++            const hint =
++                pushplus.channel && /^[0-9a-f]{32}$/i.test(pushplus.channel)
++                    ? `；channel 字段的值(${pushplus.channel})看起来像 token，疑似填错了字段`
++                    : ''
++            this.logger.warn(
++                'main',
++                'PUSHPLUS',
++                `webhook.pushplus 已启用但 token 为空，跳过推送。请在 config.json 的 webhook.pushplus.token 填写 token${hint}`
++            )
+             return
+         }
+ 
+@@ -547,6 +561,17 @@
+                     'Accept-Language': this.accountLocale.acceptLanguage
+                 })
+ 
++                // armv7l 等无 impit 预编译包的平台会回落到 undici，TLS 指纹与浏览器不一致，
++                // 微软会拒绝返回 dashboard。此时把同源请求桥接到真实 Chromium 网络栈。
++                if (this.http.backend === 'fetch') {
++                    this.http.setBrowserBridge(this.browser.func.createBrowserBridge())
++                    this.logger.info(
++                        'main',
++                        'HTTP-BRIDGE',
++                        'impit 不可用（非 x86_64/aarch64 平台），已启用浏览器网络栈桥接以绕过 TLS 指纹识别'
++                    )
++                }
++
+                 let flowError: string | undefined
+                 const result: AccountRunResult | undefined = await this.Main(account).catch(error => {
+                     flowError = error instanceof Error ? error.message : String(error)
+--- a/src/util/Http.ts	2026-09-14 10:22:10.000000000 +0800
++++ b/src/util/Http.ts	2026-09-24 22:55:07.000000000 +0800
+@@ -1,5 +1,4 @@
+-import { Impit } from 'impit'
+-import type { HttpMethod, ImpitResponse, RequestInit as ImpitRequestInit } from 'impit'
++import type { HttpMethod, RequestInit as ImpitRequestInit } from 'impit'
+ import type { AccountProxy } from '../interface/Account'
+ import { parseBrowserProxyUrl } from './Proxy'
+ 
+@@ -7,6 +6,197 @@
+ const MAX_RETRIES = 3
+ const RETRY_BASE_DELAY = 1000
+ 
++/**
++ * 跨后端的最小响应契约。impit 的 ImpitResponse 与 WHATWG fetch 的 Response
++ * 都满足它，因此上层逻辑（重试 / 解析 / 状态码判定）与具体后端解耦。
++ */
++export interface HttpHeadersLike {
++    forEach(callback: (value: string, key: string) => void): void
++    getSetCookie?: () => string[]
++}
++
++export interface HttpResponseLike {
++    status: number
++    statusText: string
++    headers: HttpHeadersLike
++    text(): Promise<string>
++}
++
++export interface HttpFetcher {
++    readonly backend: 'impit' | 'fetch'
++    fetch(url: string, init: ImpitRequestInit): Promise<HttpResponseLike>
++}
++
++/**
++ * 浏览器桥接：把请求交给真实 Chromium 的网络栈执行。
++ *
++ * armv7l 等平台没有 impit 预编译包，HTTP 层会回落到 undici，TLS/HTTP2 指纹
++ * 与浏览器不一致，微软会把 rewards.bing.com 的请求判定为未登录（返回登录页）
++ * 或把 flyout 降级为匿名响应。此时让同源请求走浏览器即可拿到真实数据。
++ * 返回 null 表示"本次不走浏览器"，调用方应回落到普通 fetch。
++ */
++export interface BrowserBridgeResult {
++    status: number
++    statusText: string
++    text: string
++}
++
++export type BrowserBridgeFetch = (
++    url: string,
++    init: { method?: string; headers?: Record<string, string>; body?: unknown }
++) => Promise<BrowserBridgeResult | null>
++
++function makeBridgedResponse(result: BrowserBridgeResult): HttpResponseLike {
++    const headers = new Map<string, string>()
++
++    return {
++        status: result.status,
++        statusText: result.statusText || 'OK',
++        headers: {
++            forEach(callback: (value: string, key: string) => void): void {
++                headers.forEach((value, key) => callback(value, key))
++            }
++        },
++        text: async () => result.text
++    }
++}
++
++/** 给任意后端套一层浏览器桥接：桥接返回 null 时自动回落到原后端 */
++function wrapWithBrowserBridge(inner: HttpFetcher, bridge: BrowserBridgeFetch): HttpFetcher {
++    return {
++        backend: inner.backend,
++        fetch: async (url, init) => {
++            try {
++                const result = await bridge(url, {
++                    method: init.method,
++                    headers: init.headers as Record<string, string> | undefined,
++                    body: init.body
++                })
++
++                if (result && typeof result.text === 'string') {
++                    return makeBridgedResponse(result)
++                }
++            } catch {
++                /* 桥接失败不影响主流程，回落到原后端 */
++            }
++
++            return inner.fetch(url, init)
++        }
++    }
++}
++
++let fallbackWarned = false
++
++function createImpitFetcher(proxyUrl: string | undefined, timeout: number): HttpFetcher | null {
++    try {
++        // impit 只发布了 x86_64 / aarch64 的原生二进制，armv7l 上 require 会抛错。
++        // 因此这里必须容错，失败时回落到 Node 内置的 fetch(undici)。
++        // eslint-disable-next-line @typescript-eslint/no-require-imports
++        const impitModule = require('impit') as {
++            Impit?: new (options: {
++                browser?: string
++                proxyUrl?: string
++                timeout?: number
++            }) => { fetch(url: string, init: ImpitRequestInit): Promise<HttpResponseLike> }
++        }
++
++        const ImpitCtor = impitModule.Impit
++        if (!ImpitCtor) return null
++
++        const instance = new ImpitCtor({ browser: 'chrome', proxyUrl, timeout })
++        return {
++            backend: 'impit',
++            fetch: (url, init) => instance.fetch(url, init)
++        }
++    } catch {
++        return null
++    }
++}
++
++function createFetchFetcher(proxyUrl: string | undefined, timeout: number): HttpFetcher {
++    // 慢速设备(armhf 小盒子)上 DNS+TCP+TLS 握手很容易超过 undici 默认的 10s connect 超时,
++    // 会抛 UND_ERR_CONNECT_TIMEOUT(表现为 "fetch failed")。AbortSignal.timeout 只管整体,
++    // 改不了 undici 内部的 connect 超时 —— 必须显式建 Agent/ProxyAgent 放宽。
++    const connectTimeout = Math.max(15000, Math.min(timeout * 2, 60000))
++    const headersTimeout = Math.max(30000, timeout)
++    const bodyTimeout = Math.max(30000, timeout)
++    const connect = { timeout: connectTimeout }
++
++    let dispatcher: unknown
++    let dispatcherReady: Promise<void> | null = null
++
++    const ensureDispatcher = async (): Promise<unknown> => {
++        if (!dispatcherReady) {
++            dispatcherReady = (async () => {
++                try {
++                    const undici = await import('undici')
++                    dispatcher = proxyUrl
++                        ? new undici.ProxyAgent({
++                              uri: proxyUrl,
++                              connect,
++                              headersTimeout,
++                              bodyTimeout
++                          })
++                        : new undici.Agent({ connect, headersTimeout, bodyTimeout })
++                } catch {
++                    if (proxyUrl) {
++                        throw new Error(
++                            'HTTP 层已回落到 fetch 后端，但代理支持需要 undici。请执行: npm i undici'
++                        )
++                    }
++                    // 拿不到 undici 就退回全局 fetch(无自定义超时),不阻断主流程
++                    dispatcher = undefined
++                }
++            })()
++        }
++        await dispatcherReady
++        return dispatcher
++    }
++
++    return {
++        backend: 'fetch',
++        fetch: async (url, init) => {
++            const activeDispatcher = await ensureDispatcher()
++            const response = await globalThis.fetch(url, {
++                method: init.method,
++                headers: init.headers as HeadersInit | undefined,
++                body: init.body as BodyInit | undefined,
++                signal: AbortSignal.timeout(init.timeout ?? timeout),
++                ...(activeDispatcher ? { dispatcher: activeDispatcher } : {})
++            } as RequestInit)
++
++            return response as unknown as HttpResponseLike
++        }
++    }
++}
++
++/**
++ * 优先使用 impit（保留浏览器 TLS/HTTP2 指纹），不可用时回落到 fetch。
++ * 可用 MRS_HTTP_BACKEND=impit|fetch 强制指定。
++ */
++function createFetcher(proxyUrl: string | undefined, timeout: number): HttpFetcher {
++    const forced = process.env.MRS_HTTP_BACKEND?.toLowerCase()
++
++    if (forced !== 'fetch') {
++        const impitFetcher = createImpitFetcher(proxyUrl, timeout)
++        if (impitFetcher) return impitFetcher
++
++        if (forced === 'impit') {
++            throw new Error('MRS_HTTP_BACKEND=impit 被强制指定，但 impit 原生模块加载失败')
++        }
++
++        if (!fallbackWarned) {
++            fallbackWarned = true
++            console.warn(
++                '[HTTP] impit 原生模块在当前平台不可用（无 armv7l 预编译包），已回落到 fetch 后端。' +
++                    'TLS 指纹伪装会降级；如需代理支持请执行 npm i undici。'
++            )
++        }
++    }
++
++    return createFetchFetcher(proxyUrl, timeout)
++}
++
+ export interface HttpRequestConfig {
+     url?: string
+     method?: string
+@@ -87,9 +277,27 @@
+     return { url, init }
+ }
+ 
+-async function toResponse<T>(res: ImpitResponse, config: HttpRequestConfig): Promise<HttpResponse<T>> {
++async function toResponse<T>(res: HttpResponseLike, config: HttpRequestConfig): Promise<HttpResponse<T>> {
+     const text = await res.text()
+ 
++    // 临时排障开关: MRS_HTTP_DEBUG=1 时打印概要,并把完整响应体落盘到 /tmp/mrs-httpdump/
++    if (process.env.MRS_HTTP_DEBUG === '1') {
++        console.log(
++            `[HTTP-DEBUG] ${config.method ?? 'GET'} ${config.url ?? '?'} -> ${res.status} | ${text
++                .slice(0, 400)
++                .replace(/\s+/g, ' ')}`
++        )
++        try {
++            const fs = await import('node:fs')
++            const dir = '/tmp/mrs-httpdump'
++            fs.mkdirSync(dir, { recursive: true })
++            const name = (config.url ?? 'unknown').replace(/[^a-zA-Z0-9]/g, '_').slice(-50)
++            fs.writeFileSync(`${dir}/${Date.now()}-${name}.txt`, text)
++        } catch {
++            /* 落盘失败不影响主流程 */
++        }
++    }
++
+     let data: unknown = text
+     if (config.responseType !== 'text') {
+         try {
+@@ -104,7 +312,7 @@
+         headers[key.toLowerCase()] = value
+     })
+ 
+-    const withSetCookie = res.headers as Headers & { getSetCookie?: () => string[] }
++    const withSetCookie = res.headers as HttpHeadersLike & { getSetCookie?: () => string[] }
+     const setCookie = typeof withSetCookie.getSetCookie === 'function' ? withSetCookie.getSetCookie() : undefined
+     if (setCookie && setCookie.length) headers['set-cookie'] = setCookie
+ 
+@@ -123,7 +331,7 @@
+ }
+ 
+ async function send<T>(
+-    instance: Impit,
++    fetcher: HttpFetcher,
+     url: string,
+     init: ImpitRequestInit,
+     config: HttpRequestConfig
+@@ -135,7 +343,7 @@
+         let responseStatus: number | undefined
+ 
+         try {
+-            const res = await instance.fetch(url, init)
++            const res = await fetcher.fetch(url, init)
+             responseStatus = res.status
+             const out = await toResponse<T>(res, config)
+ 
+@@ -168,8 +376,9 @@
+ }
+ 
+ class HttpClient {
+-    private instance: Impit
+-    private direct?: Impit
++    private raw: HttpFetcher
++    private instance: HttpFetcher
++    private direct: HttpFetcher | null = null
+     private account: AccountProxy
+     private defaultHeaders: Record<string, unknown>
+ 
+@@ -179,7 +388,22 @@
+ 
+         const proxyUrl = this.account.url && this.account.proxyHttp ? this.buildProxyUrl(this.account) : undefined
+ 
+-        this.instance = new Impit({ browser: 'chrome', proxyUrl, timeout: DEFAULT_TIMEOUT })
++        this.raw = createFetcher(proxyUrl, DEFAULT_TIMEOUT)
++        this.instance = this.raw
++    }
++
++    /** 当前 HTTP 后端：impit（浏览器指纹）或 fetch（undici，指纹会降级） */
++    public get backend(): 'impit' | 'fetch' {
++        return this.raw.backend
++    }
++
++    /**
++     * 注册浏览器桥接。armv7l 等无 impit 的平台靠它绕过 TLS 指纹识别。
++     * 传 null 可解除桥接。
++     */
++    public setBrowserBridge(bridge: BrowserBridgeFetch | null): void {
++        this.instance = bridge ? wrapWithBrowserBridge(this.raw, bridge) : this.raw
++        this.direct = null
+     }
+ 
+     public setDefaultHeaders(headers: Record<string, unknown>): void {
+@@ -194,7 +418,7 @@
+         const { url, init } = toInit(requestConfig)
+ 
+         if (!useProxy) {
+-            if (!this.direct) this.direct = new Impit({ browser: 'chrome', timeout: DEFAULT_TIMEOUT })
++            if (!this.direct) this.direct = createFetcher(undefined, DEFAULT_TIMEOUT)
+             return send<T>(this.direct, url, init, requestConfig)
+         }
+ 
+@@ -218,12 +442,12 @@
+     }
+ }
+ 
+-let sharedInstance: Impit | undefined
++let sharedFetcher: HttpFetcher | undefined
+ 
+ export async function httpRequest<T = unknown>(config: HttpRequestConfig): Promise<HttpResponse<T>> {
+-    if (!sharedInstance) sharedInstance = new Impit({ browser: 'chrome', timeout: DEFAULT_TIMEOUT })
++    if (!sharedFetcher) sharedFetcher = createFetcher(undefined, DEFAULT_TIMEOUT)
+     const { url, init } = toInit(config)
+-    return send<T>(sharedInstance, url, init, config)
++    return send<T>(sharedFetcher, url, init, config)
+ }
+ 
+ export default HttpClient
+--- a/package.json	2026-09-14 10:22:10.000000000 +0800
++++ b/package.json	2026-09-24 19:28:25.000000000 +0800
+@@ -5,7 +5,7 @@
+     "author": "Netsky",
+     "license": "GPL-3.0-or-later",
+     "engines": {
+-        "node": ">=24.0.0"
++        "node": ">=22.0.0"
+     },
+     "scripts": {
+         "pre-build": "npm i && rimraf dist && npx patchright install chromium",
+@@ -64,6 +64,7 @@
+         "qrcode-terminal": "^0.12.0",
+         "semver": "^7.8.1",
+         "ts-node": "^10.9.2",
++        "undici": "^7.29.1",
+         "zod": "^4.4.3"
+     }
+ }
