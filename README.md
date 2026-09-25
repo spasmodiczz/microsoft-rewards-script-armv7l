@@ -303,8 +303,9 @@ cp deploy/config.rk3229.example.json config.json
 | `clusters` | `1` | 单账号 + 小内存，多进程只会 OOM |
 | `accountDelay` | 拉长 | 弱设备单轮耗时长，避免账号间抢资源 |
 | `globalTimeout` | 适中 | 兼顾慢网络与不无限挂起 |
-| `searchSettings.parallelSearching` / `clusterSearch` | 关闭 | 并发搜索在弱设备上必崩 |
-| `searchSettings.blockMedia` | `true` | 拦截图片/媒体，省内存省流量 |
+| `searchSettings.parallelSearching` / `searchSettings.clusterSearch` | `false` | 并发搜索在弱设备上必崩 |
+| `experimental.blockMedia` | `true` | 拦截图片/媒体，省内存省流量（注意路径在 `experimental` 下，不是 `searchSettings`） |
+| `debugLogs` | `true` | 保留详细日志便于排障；**磁盘紧张时可改 `false`**（开启后单日日志可达十几 MB） |
 
 ### 本 fork 新增的环境变量
 

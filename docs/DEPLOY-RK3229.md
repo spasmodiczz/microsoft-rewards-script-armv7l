@@ -89,7 +89,8 @@ sudo bash deploy/deploy-rk3229.sh
 | `clusterSearch` | `false` | 不并行多标签 |
 | `searchDelay` | `1–2min` | **重点**：模板默认的 6–12min 会让单账号跑 **9 小时以上** |
 | `readDelay` | `1–2min` | ReadToEarn 有 10 篇文章，同理 |
-| `blockMedia` | `true` | 阻断图片/音视频，明显省内存和带宽 |
+| `experimental.blockMedia` | `true` | 阻断图片/音视频，明显省内存和带宽（路径在 `experimental` 下） |
+| `debugLogs` | `true` | 详细日志，便于排障；磁盘紧张时改 `false` |
 | `globalTimeout` | `90sec` | 实测单页 15.6 秒、首次更慢，默认 30 秒不够 |
 
 ---
